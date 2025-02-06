@@ -2,14 +2,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Literal, Optional, overload
 
 import aiohttp
-from aiocache import cached
 import requests
-
-
 from open_webui.apps.webui.models.models import Models
 from open_webui.config import (
     CACHE_DIR,
@@ -19,12 +17,12 @@ from open_webui.config import (
     OPENAI_API_KEYS,
     OPENAI_API_CONFIGS,
     AppConfig,
+    PersistentConfig,
 )
 from open_webui.env import (
     AIOHTTP_CLIENT_TIMEOUT,
     AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST,
     ENABLE_FORWARD_USER_INFO_HEADERS,
-    BYPASS_MODEL_ACCESS_CONTROL,
 )
 
 from open_webui.constants import ERROR_MESSAGES
@@ -200,12 +198,20 @@ async def aiohttp_get(url, key=None):
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
     try:
         headers = {"Authorization": f"Bearer {key}"} if key else {}
+        log.info(f"Requesting models from URL: {url}")
+        
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.get(url, headers=headers) as response:
-                return await response.json()
+                if response.status != 200:
+                    error_text = await response.text()
+                    log.error(f"API request failed with status {response.status}: {error_text}")
+                    return None
+                    
+                result = await response.json()
+                log.info(f"Successfully retrieved models from {url}")
+                return result
     except Exception as e:
-        # Handle connection error here
-        log.error(f"Connection error: {e}")
+        log.error(f"Connection error for {url}: {str(e)}")
         return None
 
 
@@ -220,37 +226,54 @@ async def cleanup_response(
 
 
 def merge_models_lists(model_lists):
-    log.debug(f"merge_models_lists {model_lists}")
+    log.debug(f"merge_models_lists input: {model_lists}")
     merged_list = []
 
     for idx, models in enumerate(model_lists):
-        if models is not None and "error" not in models:
-            merged_list.extend(
-                [
-                    {
-                        **model,
-                        "name": model.get("name", model["id"]),
-                        "owned_by": "openai",
-                        "openai": model,
+        if models is not None:
+            # 处理字典格式的响应（key-value 对象）
+            if isinstance(models, dict) and not "data" in models:
+                for model_id, provider in models.items():
+                    merged_list.append({
+                        "id": model_id,
+                        "name": model_id,
+                        "owned_by": provider,
+                        "openai": {"id": model_id},
                         "urlIdx": idx,
-                    }
-                    for model in models
-                    if "api.openai.com"
-                    not in app.state.config.OPENAI_API_BASE_URLS[idx]
-                    or not any(
-                        name in model["id"]
-                        for name in [
-                            "babbage",
-                            "dall-e",
-                            "davinci",
-                            "embedding",
-                            "tts",
-                            "whisper",
-                        ]
-                    )
-                ]
-            )
+                        "object": "model",
+                        "created": int(time.time()),
+                    })
+            # 处理标准 OpenAI 格式的响应
+            elif isinstance(models, dict) and "data" in models and "error" not in models:
+                merged_list.extend(
+                    [
+                        {
+                            **model,
+                            "name": model.get("name", model["id"]),
+                            "owned_by": "openai",
+                            "openai": model,
+                            "urlIdx": idx,
+                        }
+                        for model in models["data"]
+                        if "api.openai.com"
+                        not in app.state.config.OPENAI_API_BASE_URLS[idx]
+                        or not any(
+                            name in model["id"]
+                            for name in [
+                                "babbage",
+                                "dall-e",
+                                "davinci",
+                                "embedding",
+                                "tts",
+                                "whisper",
+                            ]
+                        )
+                    ]
+                )
+            elif isinstance(models, list):
+                merged_list.extend(models)
 
+    log.debug(f"merge_models_lists output: {merged_list}")
     return merged_list
 
 
@@ -258,39 +281,43 @@ async def get_all_models_responses() -> list:
     if not app.state.config.ENABLE_OPENAI_API:
         return []
 
-    # Check if API KEYS length is same than API URLS length
+    log.info(f"API Base URLs: {app.state.config.OPENAI_API_BASE_URLS}")
+    log.info(f"API Keys count: {len(app.state.config.OPENAI_API_KEYS)}")
+    
+    # 检查 API Keys 和 URLs 的长度匹配
     num_urls = len(app.state.config.OPENAI_API_BASE_URLS)
     num_keys = len(app.state.config.OPENAI_API_KEYS)
 
     if num_keys != num_urls:
-        # if there are more keys than urls, remove the extra keys
+        log.warning(f"Mismatch between number of URLs ({num_urls}) and keys ({num_keys})")
         if num_keys > num_urls:
             new_keys = app.state.config.OPENAI_API_KEYS[:num_urls]
             app.state.config.OPENAI_API_KEYS = new_keys
-        # if there are more urls than keys, add empty keys
         else:
             app.state.config.OPENAI_API_KEYS += [""] * (num_urls - num_keys)
 
     tasks = []
     for idx, url in enumerate(app.state.config.OPENAI_API_BASE_URLS):
         if url not in app.state.config.OPENAI_API_CONFIGS:
+            log.info(f"Fetching models from {url}")
             tasks.append(
                 aiohttp_get(f"{url}/models", app.state.config.OPENAI_API_KEYS[idx])
             )
         else:
             api_config = app.state.config.OPENAI_API_CONFIGS.get(url, {})
-
             enable = api_config.get("enable", True)
             model_ids = api_config.get("model_ids", [])
 
             if enable:
                 if len(model_ids) == 0:
+                    log.info(f"Fetching models from configured URL {url}")
                     tasks.append(
                         aiohttp_get(
                             f"{url}/models", app.state.config.OPENAI_API_KEYS[idx]
                         )
                     )
                 else:
+                    log.info(f"Using configured model IDs for {url}: {model_ids}")
                     model_list = {
                         "object": "list",
                         "data": [
@@ -304,45 +331,35 @@ async def get_all_models_responses() -> list:
                             for model_id in model_ids
                         ],
                     }
-
                     tasks.append(asyncio.ensure_future(asyncio.sleep(0, model_list)))
-            else:
-                tasks.append(asyncio.ensure_future(asyncio.sleep(0, None)))
 
     responses = await asyncio.gather(*tasks)
-
-    for idx, response in enumerate(responses):
-        if response:
-            url = app.state.config.OPENAI_API_BASE_URLS[idx]
-            api_config = app.state.config.OPENAI_API_CONFIGS.get(url, {})
-
-            prefix_id = api_config.get("prefix_id", None)
-
-            if prefix_id:
-                for model in (
-                    response if isinstance(response, list) else response.get("data", [])
-                ):
-                    model["id"] = f"{prefix_id}.{model['id']}"
-
-    log.debug(f"get_all_models:responses() {responses}")
-
+    log.debug(f"get_all_models_responses: {responses}")
     return responses
 
 
-@cached(ttl=3)
 async def get_all_models() -> dict[str, list]:
     log.info("get_all_models()")
 
     if not app.state.config.ENABLE_OPENAI_API:
+        log.info("OpenAI API is disabled")
         return {"data": []}
 
     responses = await get_all_models_responses()
-
+    
     def extract_data(response):
+        if response and isinstance(response, dict):
+            # 如果是字典格式，直接返回
+            return response
         if response and "data" in response:
             return response["data"]
         if isinstance(response, list):
             return response
+        # 添加错误日志
+        if response:
+            log.error(f"Unexpected response format: {response}")
+        else:
+            log.error("Empty response received")
         return None
 
     models = {"data": merge_models_lists(map(extract_data, responses))}
@@ -423,7 +440,7 @@ async def get_models(url_idx: Optional[int] = None, user=Depends(get_verified_us
                 error_detail = f"Unexpected error: {str(e)}"
                 raise HTTPException(status_code=500, detail=error_detail)
 
-    if user.role == "user" and not BYPASS_MODEL_ACCESS_CONTROL:
+    if user.role == "user":
         # Filter models based on user access control
         filtered_models = []
         for model in models.get("data", []):
@@ -586,6 +603,8 @@ async def generate_chat_completion(
     # Convert the modified body back to JSON
     payload = json.dumps(payload)
 
+    log.debug(payload)
+
     headers = {}
     headers["Authorization"] = f"Bearer {key}"
     headers["Content-Type"] = "application/json"
@@ -717,3 +736,35 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
             if r:
                 r.close()
             await session.close()
+
+def extract_data(response):
+    if not response:
+        log.error("Empty response received")
+        return None
+        
+    # 如果是字典格式
+    if isinstance(response, dict):
+        # 如果包含 data 字段，返回 data 内容
+        if "data" in response:
+            return response["data"]
+        # 如果是简单的 key-value 对象，转换为标准格式
+        else:
+            transformed_data = []
+            for model_id, provider in response.items():
+                transformed_data.append({
+                    "id": model_id,
+                    "name": model_id,
+                    "owned_by": provider,
+                    "openai": {"id": model_id},
+                    "object": "model",
+                    "created": int(time.time())
+                })
+            return transformed_data
+                
+    # 如果是列表格式，直接返回
+    if isinstance(response, list):
+        return response
+        
+    # 记录意外的响应格式
+    log.error(f"Unexpected response format: {response}")
+    return None
